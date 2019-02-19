@@ -31,7 +31,7 @@ type (
 		wg          *sync.WaitGroup
 
 		info              *natsInfo
-		reconnectInterval *time.Duration
+		reconnectInterval time.Duration
 
 		publishRetryAttempts int
 		publishRetryInterval time.Duration
@@ -66,6 +66,7 @@ const (
 	defaultPublishRetryAttempts = 5
 	defaultPublishRetryInterval = 100 * time.Millisecond
 	defaultConnectRetryAttempts = 50
+	defaultReconnectInterval    = 500 * time.Millisecond
 )
 
 // NewNATS :nodoc:
@@ -81,9 +82,10 @@ func NewNATS(clusterID, clientID, url string, options ...stan.Option) (*NATS, er
 // NewNATSWithCallback IMPORTANT! Not to send any stan.NatsURL or stan.SetConnectionLostHandler as options
 func NewNATSWithCallback(clusterID, clientID, url string, fn NatsCallback, options ...stan.Option) {
 	nc := &NATS{
-		reconnectCh: make(chan struct{}, 1),
-		stopCh:      make(chan struct{}),
-		wg:          new(sync.WaitGroup),
+		reconnectCh:       make(chan struct{}, 1),
+		stopCh:            make(chan struct{}),
+		wg:                new(sync.WaitGroup),
+		reconnectInterval: defaultReconnectInterval,
 	}
 
 	options = append(options, stan.SetConnectionLostHandler(func(conn stan.Conn, reason error) {
@@ -154,7 +156,7 @@ func (n *NATS) SetPublishRetryInterval(d time.Duration) {
 
 // SetReconnectInterval :nodoc:
 func (n *NATS) SetReconnectInterval(d time.Duration) {
-	n.reconnectInterval = &d
+	n.reconnectInterval = d
 }
 
 // GetPublishRetryAttempts :nodoc:
@@ -307,7 +309,7 @@ func (n *NATS) reconnectWorker() {
 			conn, err := connect(n.info.clusterID, n.info.clientID, n.info.url, n.info.opts...)
 			if err != nil {
 				log.Error("failed to reconnect")
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(n.reconnectInterval)
 
 				// send to channel safely
 				select {
