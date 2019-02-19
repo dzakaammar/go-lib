@@ -1,14 +1,16 @@
 package natsstreaming
 
 import (
+	"encoding/json"
+	"sync"
 	"time"
 
 	redigo "github.com/gomodule/redigo/redis"
-	"github.com/jpillora/backoff"
+	"github.com/jasonlvhit/gocron"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/kumparan/go-lib/utils"
-	"github.com/nats-io/go-nats-streaming"
+	stan "github.com/nats-io/go-nats-streaming"
 )
 
 type (
@@ -16,13 +18,20 @@ type (
 	EventType string
 
 	// NatsCallback :nodoc:
-	NatsCallback func(conn stan.Conn)
+	NatsCallback func(conn *NATS)
 
 	// NATS :nodoc:
 	NATS struct {
 		conn      stan.Conn
 		redisConn *redigo.Pool
 		testing   bool
+
+		stopCh      chan struct{}
+		reconnectCh chan struct{}
+		wg          *sync.WaitGroup
+
+		info              *natsInfo
+		reconnectInterval *time.Duration
 
 		publishRetryAttempts int
 		publishRetryInterval time.Duration
@@ -41,6 +50,15 @@ type (
 		Subject string      `json:"subject"`
 		Message interface{} `json:"message"`
 	}
+
+	// natsInfo contains informations that will be use to reconnecting to nats streaming
+	natsInfo struct {
+		clusterID string
+		clientID  string
+		url       string
+		opts      []stan.Option
+		callback  NatsCallback
+	}
 )
 
 const (
@@ -52,67 +70,61 @@ const (
 
 // NewNATS :nodoc:
 func NewNATS(clusterID, clientID, url string, options ...stan.Option) (*NATS, error) {
+	nc, err := connect(clusterID, clientID, url, options...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &NATS{conn: nc, stopCh: make(chan struct{}), wg: new(sync.WaitGroup)}, nil
+}
+
+// NewNATSWithCallback IMPORTANT! Not to send any stan.NatsURL or stan.SetConnectionLostHandler as options
+func NewNATSWithCallback(clusterID, clientID, url string, fn NatsCallback, options ...stan.Option) {
+	nc := &NATS{
+		reconnectCh: make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
+		wg:          new(sync.WaitGroup),
+	}
+
+	options = append(options, stan.SetConnectionLostHandler(func(conn stan.Conn, reason error) {
+		log.Errorf("Nats connection lost! Reason: %v", reason)
+		nc.reconnectCh <- struct{}{}
+	}))
+
+	nc.info = &natsInfo{
+		url:       url,
+		clusterID: clusterID,
+		clientID:  clientID,
+		callback:  fn,
+		opts:      options,
+	}
+
+	conn, err := connect(clusterID, clientID, url, options...)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"clusterID": clusterID,
+			"clientID":  clientID,
+		}).Fatal(err)
+	}
+
+	log.WithFields(log.Fields{
+		"clusterID": clusterID,
+		"clientID":  clientID,
+	}).Info("Nats connection made...")
+
+	nc.SetConn(conn)
+	// Run callback function
+	nc.runCallback()
+}
+
+// connect to nats streaming
+func connect(clusterID, clientID, url string, options ...stan.Option) (stan.Conn, error) {
 	options = append(options, stan.NatsURL(url))
 	nc, err := stan.Connect(clusterID, clientID, options...)
 	if err != nil {
 		return nil, err
 	}
-
-	return &NATS{conn: nc, publishRetryAttempts: defaultPublishRetryAttempts, publishRetryInterval: defaultPublishRetryInterval}, nil
-}
-
-// NewNATSWithCallback IMPORTANT! Not to send any stan.NatsURL or stan.SetConnectionLostHandler as options
-func NewNATSWithCallback(clusterID, clientID, url string, fn NatsCallback, options ...stan.Option) {
-	c := make(chan int)
-	options = append(options, stan.NatsURL(url))
-	options = append(options, stan.SetConnectionLostHandler(func(conn stan.Conn, reason error) {
-		log.Errorf("Nats connection lost! Reason: %v", reason)
-
-		conn.Close()
-		c <- 1
-	}))
-	var nc stan.Conn
-	var err error
-
-	retryAttempts := 1
-	backoffer := &backoff.Backoff{
-		Min:    200 * time.Millisecond,
-		Max:    1 * time.Second,
-		Jitter: true,
-	}
-
-	for {
-		if retryAttempts >= defaultConnectRetryAttempts {
-			log.WithFields(log.Fields{
-				"clusterID": clusterID,
-				"clientID":  clientID,
-			}).Fatalf("Connect failed count reaches limit of %d. Shutting down the server...", defaultConnectRetryAttempts)
-		}
-
-		nc, err = stan.Connect(clusterID, clientID, options...)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"clusterID":     clusterID,
-				"clientID":      clientID,
-				"retryAttempts": retryAttempts,
-			}).Error(err)
-			retryAttempts++
-
-			time.Sleep(backoffer.Duration())
-			continue
-		}
-
-		log.WithFields(log.Fields{
-			"clusterID": clusterID,
-			"clientID":  clientID,
-		}).Info("Nats connection made...")
-		retryAttempts = 1
-
-		// Run callback function
-		fn(nc)
-
-		<-c
-	}
+	return nc, nil
 }
 
 // NewTestNATS :nodoc:
@@ -140,6 +152,11 @@ func (n *NATS) SetPublishRetryInterval(d time.Duration) {
 	n.publishRetryInterval = d
 }
 
+// SetReconnectInterval :nodoc:
+func (n *NATS) SetReconnectInterval(d time.Duration) {
+	n.reconnectInterval = &d
+}
+
 // GetPublishRetryAttempts :nodoc:
 func (n *NATS) GetPublishRetryAttempts() int {
 	if n.publishRetryAttempts <= 0 {
@@ -157,8 +174,42 @@ func (n *NATS) GetPublishRetryInterval() time.Duration {
 }
 
 // Close NatsConnection :nodoc:
-func (n *NATS) Close() {
-	n.conn.Close()
+func (n *NATS) Close() error {
+	close(n.stopCh)
+	n.wg.Wait()
+	close(n.reconnectCh)
+
+	if n.conn != nil {
+		err := n.conn.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	err := n.redisConn.Close()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Run :nodoc:
+func (n *NATS) Run() {
+	s := gocron.NewScheduler()
+	s.Every(1).Minutes().Do(n.publishFromRedis)
+
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		c := s.Start()
+		select {
+		case <-n.stopCh:
+			close(c)
+		}
+	}()
+
+	n.wg.Add(1)
+	go n.reconnectWorker()
 }
 
 // Publish :nodoc:
@@ -167,24 +218,20 @@ func (n *NATS) Publish(subject string, v interface{}) error {
 		return nil
 	}
 
-	giveUpErr := utils.Retry(n.GetPublishRetryAttempts(), n.GetPublishRetryInterval(), func() error {
+	if n.conn != nil {
 		err := n.conn.Publish(subject, utils.ToByte(v))
-		if err != nil {
-			client := n.redisConn.Get()
-			defer client.Close()
-
-			client.Do("RPUSH", failedMessagesRedisKey, utils.ToByte(NatsMessageWithSubject{
-				Subject: subject,
-				Message: v,
-			}))
+		if err == nil {
+			return nil
 		}
-
-		return err
-	})
-	if giveUpErr != nil {
-		log.WithField("type", "give up").Error(giveUpErr)
 	}
 
+	// Push to redis if failed
+	client := n.redisConn.Get()
+	defer client.Close()
+	client.Do("RPUSH", failedMessagesRedisKey, utils.ToByte(NatsMessageWithSubject{
+		Subject: subject,
+		Message: v,
+	}))
 	return nil
 }
 
@@ -203,4 +250,73 @@ func (n *NATS) Subscribe(subject string, cb stan.MsgHandler, opts ...stan.Subscr
 		return nil, nil
 	}
 	return n.conn.Subscribe(subject, cb, opts...)
+}
+
+func (n *NATS) runCallback() {
+	if n.info != nil && n.info.callback != nil {
+		n.info.callback(n)
+	}
+}
+
+func (n *NATS) publishFromRedis() {
+	log.Println("running worker...")
+	if n.conn == nil || n.conn.NatsConn().IsClosed() {
+		log.Println("returning due to connection problem")
+		return
+	}
+
+	client := n.redisConn.Get()
+	defer client.Close()
+
+	for {
+		b, err := redigo.Bytes(client.Do("LPOP", failedMessagesRedisKey))
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		if len(b) == 0 {
+			return
+		}
+
+		msg := new(NatsMessageWithSubject)
+		err = json.Unmarshal(b, msg)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		err = n.conn.Publish(msg.Subject, utils.ToByte(msg.Message))
+		if err == nil {
+			log.Println(err)
+			continue
+		}
+		client.Do("LPUSH", failedMessagesRedisKey, b)
+		if err == stan.ErrConnectionClosed {
+			return
+		}
+	}
+}
+
+func (n *NATS) reconnectWorker() {
+	defer n.wg.Done()
+	for {
+		select {
+		case <-n.stopCh:
+			break
+		case <-n.reconnectCh:
+			conn, err := connect(n.info.clusterID, n.info.clientID, n.info.url, n.info.opts...)
+			if err != nil {
+				log.Error("failed to reconnect")
+				time.Sleep(100 * time.Millisecond)
+
+				// send to channel safely
+				select {
+				case n.reconnectCh <- struct{}{}:
+				}
+				continue
+			}
+			n.SetConn(conn)
+			n.runCallback()
+		}
+	}
 }
