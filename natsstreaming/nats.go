@@ -272,7 +272,7 @@ func (n *NATS) publishFromRedis() {
 
 	for {
 		b, err := redigo.Bytes(client.Do("LPOP", failedMessagesRedisKey))
-		if err != nil {
+		if err != nil && err != redigo.ErrNil {
 			log.Println(err)
 			return
 		}
@@ -289,7 +289,6 @@ func (n *NATS) publishFromRedis() {
 		}
 		err = n.conn.Publish(msg.Subject, utils.ToByte(msg.Message))
 		if err == nil {
-			log.Println(err)
 			continue
 		}
 		client.Do("LPUSH", failedMessagesRedisKey, b)
@@ -304,7 +303,7 @@ func (n *NATS) reconnectWorker() {
 	for {
 		select {
 		case <-n.stopCh:
-			break
+			return
 		case <-n.reconnectCh:
 			conn, err := connect(n.info.clusterID, n.info.clientID, n.info.url, n.info.opts...)
 			if err != nil {
