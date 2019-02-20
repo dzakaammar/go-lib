@@ -32,9 +32,8 @@ type (
 
 		info              *natsInfo
 		reconnectInterval time.Duration
-
-		publishRetryAttempts int
-		publishRetryInterval time.Duration
+		isWorkerRun       bool
+		workerLock        *sync.Mutex
 	}
 
 	// NatsMessage :nodoc:
@@ -62,11 +61,8 @@ type (
 )
 
 const (
-	failedMessagesRedisKey      = "nats:failed-messages"
-	defaultPublishRetryAttempts = 5
-	defaultPublishRetryInterval = 100 * time.Millisecond
-	defaultConnectRetryAttempts = 50
-	defaultReconnectInterval    = 500 * time.Millisecond
+	failedMessagesRedisKey   = "nats:failed-messages"
+	defaultReconnectInterval = 500 * time.Millisecond
 )
 
 // NewNATS :nodoc:
@@ -86,6 +82,8 @@ func NewNATSWithCallback(clusterID, clientID, url string, fn NatsCallback, optio
 		stopCh:            make(chan struct{}),
 		wg:                new(sync.WaitGroup),
 		reconnectInterval: defaultReconnectInterval,
+		isWorkerRun:       false,
+		workerLock:        new(sync.Mutex),
 	}
 
 	options = append(options, stan.SetConnectionLostHandler(func(conn stan.Conn, reason error) {
@@ -144,35 +142,9 @@ func (n *NATS) SetRedisConn(conn *redigo.Pool) {
 	n.redisConn = conn
 }
 
-// SetPublishRetryAttempts :nodoc:
-func (n *NATS) SetPublishRetryAttempts(i int) {
-	n.publishRetryAttempts = i
-}
-
-// SetPublishRetryInterval :nodoc:
-func (n *NATS) SetPublishRetryInterval(d time.Duration) {
-	n.publishRetryInterval = d
-}
-
 // SetReconnectInterval :nodoc:
 func (n *NATS) SetReconnectInterval(d time.Duration) {
 	n.reconnectInterval = d
-}
-
-// GetPublishRetryAttempts :nodoc:
-func (n *NATS) GetPublishRetryAttempts() int {
-	if n.publishRetryAttempts <= 0 {
-		return defaultPublishRetryAttempts
-	}
-	return n.publishRetryAttempts
-}
-
-// GetPublishRetryInterval :nodoc:
-func (n *NATS) GetPublishRetryInterval() time.Duration {
-	if n.publishRetryInterval <= 1*time.Millisecond {
-		return defaultPublishRetryInterval
-	}
-	return n.publishRetryInterval
 }
 
 // Close NatsConnection :nodoc:
@@ -188,27 +160,32 @@ func (n *NATS) Close() error {
 		}
 	}
 
-	err := n.redisConn.Close()
-	if err != nil {
-		return err
+	if n.redisConn != nil {
+		err := n.redisConn.Close()
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
 // Run :nodoc:
 func (n *NATS) Run() {
-	s := gocron.NewScheduler()
-	s.Every(1).Minutes().Do(n.publishFromRedis)
+	if n.redisConn != nil {
+		s := gocron.NewScheduler()
+		s.Every(1).Minutes().Do(n.publishFromRedis)
 
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
-		c := s.Start()
-		select {
-		case <-n.stopCh:
-			close(c)
-		}
-	}()
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			c := s.Start()
+			select {
+			case <-n.stopCh:
+				close(c)
+			}
+		}()
+	}
 
 	n.wg.Add(1)
 	go n.reconnectWorker()
@@ -228,12 +205,26 @@ func (n *NATS) Publish(subject string, v interface{}) error {
 	}
 
 	// Push to redis if failed
-	client := n.redisConn.Get()
-	defer client.Close()
-	client.Do("RPUSH", failedMessagesRedisKey, utils.ToByte(NatsMessageWithSubject{
-		Subject: subject,
-		Message: v,
-	}))
+	if n.redisConn != nil {
+		client := n.redisConn.Get()
+		defer client.Close()
+		i, err := redigo.Int(client.Do("RPUSH", failedMessagesRedisKey, utils.ToByte(NatsMessageWithSubject{
+			Subject: subject,
+			Message: v,
+		})))
+		if err != nil {
+			log.WithFields(log.Fields{
+				"subject": subject,
+				"msg":     utils.ToByte(v),
+			}).Error(err)
+		}
+
+		if i%100 == 0 {
+			log.Errorf("total message that handled by redis : %+v", i)
+		}
+	} else {
+		log.Fatal("publish to nats failed and no redis conection available to handle it")
+	}
 	return nil
 }
 
@@ -261,9 +252,23 @@ func (n *NATS) runCallback() {
 }
 
 func (n *NATS) publishFromRedis() {
-	log.Println("running worker...")
-	if n.conn == nil || n.conn.NatsConn().IsClosed() {
-		log.Println("returning due to connection problem")
+	log.Info("running publish from redis...")
+	n.workerLock.Lock()
+	if n.isWorkerRun {
+		n.workerLock.Unlock()
+		return
+	}
+	n.isWorkerRun = true
+	n.workerLock.Unlock()
+
+	defer func() {
+		n.workerLock.Lock()
+		n.isWorkerRun = false
+		n.workerLock.Unlock()
+	}()
+
+	if n.conn == nil {
+		log.Error("abort due to connection problem")
 		return
 	}
 
@@ -273,7 +278,7 @@ func (n *NATS) publishFromRedis() {
 	for {
 		b, err := redigo.Bytes(client.Do("LPOP", failedMessagesRedisKey))
 		if err != nil && err != redigo.ErrNil {
-			log.Println(err)
+			log.Error(err)
 			return
 		}
 
@@ -283,16 +288,18 @@ func (n *NATS) publishFromRedis() {
 
 		msg := new(NatsMessageWithSubject)
 		err = json.Unmarshal(b, msg)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		err = n.conn.Publish(msg.Subject, utils.ToByte(msg.Message))
 		if err == nil {
-			continue
+			if n.conn != nil {
+				err = n.conn.Publish(msg.Subject, utils.ToByte(msg.Message))
+				if err == nil {
+					continue
+				}
+			}
 		}
+
 		client.Do("LPUSH", failedMessagesRedisKey, b)
 		if err == stan.ErrConnectionClosed {
+			log.Error("abort due to connection problem")
 			return
 		}
 	}
